@@ -41,93 +41,131 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           script: |
-            set -euxo pipefail
+            set -eu
             PKG=com.example.yink.amadeus.kurisutina
             APK=app/build/outputs/apk/debug/app-debug.apk
             OUT=smoke-aosp-artifacts
             mkdir -p "$OUT"
 
-            adb install -r "$APK"
+            adb install -r "$APK" | tee "$OUT/00-install.txt"
             adb shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
             adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
+            adb shell settings put system accelerometer_rotation 0 || true
+            adb shell settings put system user_rotation 0 || true
             adb logcat -c
 
-            get_res_center() {
+            tap_res() {
               RES="$1"
               adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
               adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
               python3 - "$RES" <<'PY'
-            import re, sys, xml.etree.ElementTree as ET
-            res=sys.argv[1]
-            root=ET.parse('/tmp/window.xml').getroot()
+            import re, subprocess, sys, xml.etree.ElementTree as ET
+            res = sys.argv[1]
+            root = ET.parse('/tmp/window.xml').getroot()
             for node in root.iter('node'):
-                if node.attrib.get('resource-id','').endswith('/'+res):
-                    m=re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',node.attrib.get('bounds',''))
+                if node.attrib.get('resource-id', '').endswith('/' + res):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds', ''))
                     if m:
-                        x1,y1,x2,y2=map(int,m.groups())
-                        print(f'{(x1+x2)//2} {(y1+y2)//2}')
+                        x1, y1, x2, y2 = map(int, m.groups())
+                        x, y = (x1 + x2) // 2, (y1 + y2) // 2
+                        print(f'tap {res} at {x},{y}')
+                        subprocess.check_call(['adb', 'shell', 'input', 'tap', str(x), str(y)])
                         raise SystemExit(0)
+            print('resource not found:', res)
             raise SystemExit(2)
             PY
             }
 
-            tap_res() {
-              read X Y <<< "$(get_res_center "$1")"
-              adb shell input tap "$X" "$Y"
+            long_press_res() {
+              RES="$1"
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
+              python3 - "$RES" <<'PY'
+            import re, subprocess, sys, xml.etree.ElementTree as ET
+            res = sys.argv[1]
+            root = ET.parse('/tmp/window.xml').getroot()
+            for node in root.iter('node'):
+                if node.attrib.get('resource-id', '').endswith('/' + res):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds', ''))
+                    if m:
+                        x1, y1, x2, y2 = map(int, m.groups())
+                        x, y = (x1 + x2) // 2, (y1 + y2) // 2
+                        print(f'long press {res} at {x},{y}')
+                        subprocess.check_call(['adb', 'shell', 'input', 'swipe', str(x), str(y), str(x), str(y), '1500'])
+                        raise SystemExit(0)
+            print('resource not found:', res)
+            raise SystemExit(2)
+            PY
             }
 
-            long_res() {
-              read X Y <<< "$(get_res_center "$1")"
-              adb shell input swipe "$X" "$Y" "$X" "$Y" 1500
+            dump_state() {
+              NAME="$1"
+              adb exec-out screencap -p > "$OUT/${NAME}.png" || true
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml "$OUT/${NAME}.xml" >/dev/null || true
+              adb shell dumpsys activity activities | grep -m1 mResumedActivity > "$OUT/${NAME}-resumed.txt" || true
             }
 
             # Verify LineageOS-like condition: Google Search app should be absent.
             adb shell pm path com.google.android.googlequicksearchbox > "$OUT/google-app.txt" 2>&1 || true
+            adb shell cmd package query-services -a android.speech.RecognitionService > "$OUT/speech-services.txt" 2>&1 || true
 
-            # Cold launch.
+            # 1. Cold launch.
             adb shell am force-stop "$PKG"
             adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" | tee "$OUT/01-launch-result.txt"
             sleep 3
-            adb exec-out screencap -p > "$OUT/01-launch.png"
-            adb shell uiautomator dump /sdcard/window.xml || true
-            adb pull /sdcard/window.xml "$OUT/01-launch.xml" || true
+            dump_state 01-launch
 
-            # Connect -> MainActivity.
+            # 2. Connect -> MainActivity. This must work without Google Search.
             tap_res imageView_connect
             sleep 6
-            adb shell dumpsys activity activities | grep -m1 mResumedActivity | tee "$OUT/02-resumed.txt" || true
-            adb exec-out screencap -p > "$OUT/02-main.png"
-            adb shell uiautomator dump /sdcard/window.xml || true
-            adb pull /sdcard/window.xml "$OUT/02-main.xml" || true
+            dump_state 02-main
+            if ! grep -q 'MainActivity' "$OUT/02-main-resumed.txt"; then
+              echo 'Connect did not reach MainActivity.' | tee "$OUT/02-main-failure.txt"
+              adb logcat -d > "$OUT/logcat.txt"
+              exit 3
+            fi
 
-            # Single tap (speech fallback on AOSP must not crash).
+            # 3. Single tap on Kurisu. With no speech provider it must degrade without crashing.
             tap_res imageView_kurisu
             sleep 2
-            adb exec-out screencap -p > "$OUT/03-speech-fallback.png"
+            dump_state 03-speech-fallback
 
-            # Long press loop toggle.
-            long_res imageView_kurisu
+            # 4. Long press loop toggle.
+            long_press_res imageView_kurisu
             sleep 2
-            adb exec-out screencap -p > "$OUT/04-long-press.png"
+            dump_state 04-long-press
 
-            # Settings.
+            # 5. Settings entry via launch logo.
             adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" >/dev/null
             sleep 2
             tap_res imageView_logo
             sleep 2
-            adb exec-out screencap -p > "$OUT/05-settings.png"
+            dump_state 05-settings
+            if ! grep -q 'SettingsActivity' "$OUT/05-settings-resumed.txt"; then
+              echo 'SettingsActivity did not become resumed.' | tee "$OUT/05-settings-failure.txt"
+              adb logcat -d > "$OUT/logcat.txt"
+              exit 4
+            fi
 
-            # Alarm activity can at least be created on API 36.
+            # 6. Alarm screen creation smoke test.
             adb shell am start -W -n "$PKG/com.example.yink.amadeus.AlarmActivity" | tee "$OUT/06-alarm-result.txt"
             sleep 2
-            adb exec-out screencap -p > "$OUT/06-alarm.png"
+            dump_state 06-alarm
+            if ! grep -q 'AlarmActivity' "$OUT/06-alarm-resumed.txt"; then
+              echo 'AlarmActivity did not become resumed.' | tee "$OUT/06-alarm-failure.txt"
+              adb logcat -d > "$OUT/logcat.txt"
+              exit 5
+            fi
 
             adb logcat -d > "$OUT/logcat.txt"
             adb shell dumpsys package "$PKG" > "$OUT/package.txt"
             if grep -E "FATAL EXCEPTION|Process: ${PKG}.*has died" "$OUT/logcat.txt"; then
-              echo "Amadeus crashed on the Android 16 AOSP image."
-              exit 1
+              echo 'Amadeus crashed during Android 16 AOSP smoke test.'
+              exit 6
             fi
+
+            echo 'ANDROID16_AOSP_SMOKE=PASS' | tee "$OUT/result.txt"
 
       - name: Upload AOSP screenshots and logs
         if: always()
