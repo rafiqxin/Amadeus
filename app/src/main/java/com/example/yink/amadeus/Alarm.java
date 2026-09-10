@@ -88,6 +88,8 @@ class Alarm {
             notificationManager.cancel(ALARM_NOTIFICATION_ID);
         }
 
+        context.stopService(new Intent(context, AlarmService.class));
+
         releaseCpuLock();
         isPlaying = false;
 
