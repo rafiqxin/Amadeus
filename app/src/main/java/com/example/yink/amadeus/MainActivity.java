@@ -5,7 +5,6 @@ package com.example.yink.amadeus;
  */
 
 import android.Manifest;
-import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -31,8 +30,8 @@ public class MainActivity extends AppCompatActivity {
 
     private final String TAG = "MainActivity";
 
-    private VoiceLine[] voiceLines = VoiceLine.Line.getLines();
-    private Random randomgen = new Random();
+    private final VoiceLine[] voiceLines = VoiceLine.Line.getLines();
+    private final Random randomgen = new Random();
     private String recogLang;
     private String[] contextLang;
     private SpeechRecognizer sr;
@@ -48,8 +47,22 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences settings = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
         recogLang = settings.getString("recognition_lang", "ja-JP");
         contextLang = recogLang.split("-");
-        sr = SpeechRecognizer.createSpeechRecognizer(this);
-        sr.setRecognitionListener(new listener());
+
+        // Do not crash or block the UI when a ROM has no speech recognition
+        // provider installed. The Amadeus visual/voice experience remains usable.
+        if (SpeechRecognizer.isRecognitionAvailable(this)) {
+            try {
+                sr = SpeechRecognizer.createSpeechRecognizer(this);
+                sr.setRecognitionListener(new listener());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Speech recognition provider could not be created", e);
+                sr = null;
+            }
+        } else {
+            Log.w(TAG, "No SpeechRecognizer provider is available on this device");
+            sr = null;
+        }
+
         final Handler handler = new Handler();
         final int REQUEST_PERMISSION_RECORD_AUDIO = 11302;
 
@@ -57,8 +70,14 @@ public class MainActivity extends AppCompatActivity {
             subtitlesBackground.setVisibility(View.INVISIBLE);
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            ActivityCompat.requestPermissions(MainActivity.this, new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_PERMISSION_RECORD_AUDIO);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                    MainActivity.this,
+                    new String[]{Manifest.permission.RECORD_AUDIO},
+                    REQUEST_PERMISSION_RECORD_AUDIO
+            );
         }
 
         Amadeus.speak(voiceLines[VoiceLine.Line.HELLO], MainActivity.this);
@@ -76,26 +95,30 @@ public class MainActivity extends AppCompatActivity {
         kurisu.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    MainActivity host = (MainActivity) view.getContext();
-
-                    int permissionCheck = ContextCompat.checkSelfPermission(host,
-                            Manifest.permission.RECORD_AUDIO);
-
-                    /* Input during loop produces bugs and mixes with output */
-                    if (!Amadeus.isLoop && !Amadeus.isSpeaking) {
-                        if (permissionCheck == PackageManager.PERMISSION_GRANTED) {
-                            promptSpeechInput();
-                        } else {
-                            Amadeus.speak(voiceLines[VoiceLine.Line.DAGA_KOTOWARU], MainActivity.this);
-                        }
-                    }
-
-                } else if (!Amadeus.isLoop && !Amadeus.isSpeaking) {
-                    promptSpeechInput();
+                if (Amadeus.isLoop || Amadeus.isSpeaking) {
+                    return;
                 }
-            }});
 
+                int permissionCheck = ContextCompat.checkSelfPermission(
+                        MainActivity.this,
+                        Manifest.permission.RECORD_AUDIO
+                );
+
+                if (permissionCheck != PackageManager.PERMISSION_GRANTED) {
+                    Amadeus.speak(voiceLines[VoiceLine.Line.DAGA_KOTOWARU], MainActivity.this);
+                    return;
+                }
+
+                if (sr == null) {
+                    // AOSP/LineageOS builds can legitimately have no recognizer.
+                    // Keep the app alive and provide the normal fallback voice line.
+                    Amadeus.speak(voiceLines[VoiceLine.Line.SORRY], MainActivity.this);
+                    return;
+                }
+
+                promptSpeechInput();
+            }
+        });
 
         kurisu.setOnLongClickListener(new View.OnLongClickListener() {
             @Override
@@ -119,11 +142,18 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
-        if (sr != null)
+        if (sr != null) {
             sr.destroy();
-        if (Amadeus.m != null)
-            Amadeus.m.release();
+            sr = null;
+        }
+        if (Amadeus.m != null) {
+            try {
+                Amadeus.m.release();
+            } catch (Exception ignored) {
+            }
+            Amadeus.m = null;
+        }
+        super.onDestroy();
     }
 
     @Override
@@ -139,41 +169,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void promptSpeechInput() {
+        if (sr == null) {
+            return;
+        }
+
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, recogLang);
 
-        /* Temporary workaround for strange bug on 4.0.3-4.0.4 */
-        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.ICE_CREAM_SANDWICH_MR1) {
-            try {
-                startActivityForResult(intent, 1);
-            } catch (ActivityNotFoundException a) {
-                a.printStackTrace();
-            }
-        } else {
+        try {
             sr.startListening(intent);
-        }
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-
-        switch (requestCode) {
-            case 1: {
-                if (resultCode == RESULT_OK && null != data) {
-
-                    /* Switch language within current context for voice recognition */
-                    Context context = LangContext.load(getApplicationContext(), contextLang[0]);
-
-                    ArrayList<String> input = data
-                            .getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
-                    Amadeus.responseToInput(input.get(0), context, MainActivity.this);
-                }
-                break;
-            }
-
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to start speech recognition", e);
+            Amadeus.speak(voiceLines[VoiceLine.Line.SORRY], MainActivity.this);
         }
     }
 
@@ -184,44 +192,50 @@ public class MainActivity extends AppCompatActivity {
         public void onReadyForSpeech(Bundle params) {
             Log.d(TAG, "Speech recognition start");
         }
+
         public void onBeginningOfSpeech() {
             Log.d(TAG, "Listening speech");
         }
+
         public void onRmsChanged(float rmsdB) {
-            //Log.d(TAG, "onRmsChanged");
         }
+
         public void onBufferReceived(byte[] buffer) {
             Log.d(TAG, "onBufferReceived");
         }
+
         public void onEndOfSpeech() {
             Log.d(TAG, "Speech recognition end");
         }
+
         public void onError(int error) {
-            Log.d(TAG,  "error " +  error);
-            sr.cancel();
+            Log.d(TAG, "error " + error);
+            if (sr != null) {
+                sr.cancel();
+            }
             Amadeus.speak(voiceLines[VoiceLine.Line.SORRY], MainActivity.this);
         }
+
         public void onResults(Bundle results) {
-            String input = "";
-            String debug = "";
-            Log.d(TAG, "Received results");
-            ArrayList data = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-
-            for (Object word: data) {
-                debug += word + "\n";
+            ArrayList<String> data = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+            if (data == null || data.isEmpty()) {
+                Amadeus.speak(voiceLines[VoiceLine.Line.SORRY], MainActivity.this);
+                return;
             }
-            Log.d(TAG, debug);
 
-            input += data.get(0);
-            /* TODO: Japanese doesn't split the words. Sigh. */
+            StringBuilder debug = new StringBuilder();
+            for (String word : data) {
+                debug.append(word).append('\n');
+            }
+            Log.d(TAG, debug.toString());
+
+            String input = data.get(0);
             String[] splitInput = input.split(" ");
 
-            /* Really, google? */
-            if (splitInput[0].equalsIgnoreCase("Асистент")) {
+            if (splitInput.length > 0 && splitInput[0].equalsIgnoreCase("Асистент")) {
                 splitInput[0] = "Ассистент";
             }
 
-            /* Switch language within current context for voice recognition */
             Context context = LangContext.load(getApplicationContext(), contextLang[0]);
 
             if (splitInput.length > 2 && splitInput[0].equalsIgnoreCase(context.getString(R.string.assistant))) {
@@ -232,18 +246,17 @@ public class MainActivity extends AppCompatActivity {
                 if (cmd.contains(context.getString(R.string.open))) {
                     Amadeus.openApp(args, MainActivity.this);
                 }
-
             } else {
                 Amadeus.responseToInput(input, context, MainActivity.this);
             }
         }
+
         public void onPartialResults(Bundle partialResults) {
             Log.d(TAG, "onPartialResults");
         }
+
         public void onEvent(int eventType, Bundle params) {
             Log.d(TAG, "onEvent " + eventType);
         }
-
     }
-
 }
