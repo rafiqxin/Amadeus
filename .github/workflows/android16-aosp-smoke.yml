@@ -1,0 +1,138 @@
+name: Android 16 AOSP / LineageOS-like Smoke Test
+
+on:
+  push:
+    branches:
+      - modernize/android-36
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-aosp:
+    if: contains(github.event.head_commit.message, '[smoke aosp16]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Run API 36 AOSP smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: aosp_atd
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            set -euxo pipefail
+            PKG=com.example.yink.amadeus.kurisutina
+            APK=app/build/outputs/apk/debug/app-debug.apk
+            OUT=smoke-aosp-artifacts
+            mkdir -p "$OUT"
+
+            adb install -r "$APK"
+            adb shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
+            adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
+            adb logcat -c
+
+            get_res_center() {
+              RES="$1"
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
+              python3 - "$RES" <<'PY'
+            import re, sys, xml.etree.ElementTree as ET
+            res=sys.argv[1]
+            root=ET.parse('/tmp/window.xml').getroot()
+            for node in root.iter('node'):
+                if node.attrib.get('resource-id','').endswith('/'+res):
+                    m=re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',node.attrib.get('bounds',''))
+                    if m:
+                        x1,y1,x2,y2=map(int,m.groups())
+                        print(f'{(x1+x2)//2} {(y1+y2)//2}')
+                        raise SystemExit(0)
+            raise SystemExit(2)
+            PY
+            }
+
+            tap_res() {
+              read X Y <<< "$(get_res_center "$1")"
+              adb shell input tap "$X" "$Y"
+            }
+
+            long_res() {
+              read X Y <<< "$(get_res_center "$1")"
+              adb shell input swipe "$X" "$Y" "$X" "$Y" 1500
+            }
+
+            # Verify LineageOS-like condition: Google Search app should be absent.
+            adb shell pm path com.google.android.googlequicksearchbox > "$OUT/google-app.txt" 2>&1 || true
+
+            # Cold launch.
+            adb shell am force-stop "$PKG"
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" | tee "$OUT/01-launch-result.txt"
+            sleep 3
+            adb exec-out screencap -p > "$OUT/01-launch.png"
+            adb shell uiautomator dump /sdcard/window.xml || true
+            adb pull /sdcard/window.xml "$OUT/01-launch.xml" || true
+
+            # Connect -> MainActivity.
+            tap_res imageView_connect
+            sleep 6
+            adb shell dumpsys activity activities | grep -m1 mResumedActivity | tee "$OUT/02-resumed.txt" || true
+            adb exec-out screencap -p > "$OUT/02-main.png"
+            adb shell uiautomator dump /sdcard/window.xml || true
+            adb pull /sdcard/window.xml "$OUT/02-main.xml" || true
+
+            # Single tap (speech fallback on AOSP must not crash).
+            tap_res imageView_kurisu
+            sleep 2
+            adb exec-out screencap -p > "$OUT/03-speech-fallback.png"
+
+            # Long press loop toggle.
+            long_res imageView_kurisu
+            sleep 2
+            adb exec-out screencap -p > "$OUT/04-long-press.png"
+
+            # Settings.
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" >/dev/null
+            sleep 2
+            tap_res imageView_logo
+            sleep 2
+            adb exec-out screencap -p > "$OUT/05-settings.png"
+
+            # Alarm activity can at least be created on API 36.
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.AlarmActivity" | tee "$OUT/06-alarm-result.txt"
+            sleep 2
+            adb exec-out screencap -p > "$OUT/06-alarm.png"
+
+            adb logcat -d > "$OUT/logcat.txt"
+            adb shell dumpsys package "$PKG" > "$OUT/package.txt"
+            if grep -E "FATAL EXCEPTION|Process: ${PKG}.*has died" "$OUT/logcat.txt"; then
+              echo "Amadeus crashed on the Android 16 AOSP image."
+              exit 1
+            fi
+
+      - name: Upload AOSP screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amadeus-android16-aosp-smoke
+          path: smoke-aosp-artifacts
+          if-no-files-found: warn
