@@ -1,0 +1,49 @@
+name: Publish Android 16 Alpha 7
+
+on:
+  push:
+    branches:
+      - modernize/android-36
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: contains(github.event.head_commit.message, '[release alpha7]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Build Android 16 debug APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk Amadeus-0.9.6-alpha.7-Android16-debug.apk
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v0.9.6-alpha.7 >/dev/null 2>&1 || \
+            gh release create v0.9.6-alpha.7 \
+              --target "$GITHUB_SHA" \
+              --title "Amadeus 0.9.6-alpha.7 — Android 16 compatibility" \
+              --prerelease \
+              --notes "Android 16 / API 36 compatibility test build. Removes the hard Google App gate, adds SpeechRecognizer service visibility, modern PendingIntent flags, notification runtime/channel handling, exact-alarm access handling, and foreground alarm service compatibility. This is a debug-signed prerelease intended for LineageOS 23 / Android 16 device testing." \
+              Amadeus-0.9.6-alpha.7-Android16-debug.apk
+          gh release upload v0.9.6-alpha.7 Amadeus-0.9.6-alpha.7-Android16-debug.apk --clobber
