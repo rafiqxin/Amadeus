@@ -11,7 +11,7 @@ permissions:
 jobs:
   smoke-aosp:
     if: contains(github.event.head_commit.message, '[smoke aosp16]')
-    runs-on: ubuntu-latest
+    runs-on: macos-13
     timeout-minutes: 30
 
     steps:
@@ -106,17 +106,14 @@ jobs:
               adb shell dumpsys activity activities | grep -m1 mResumedActivity > "$OUT/${NAME}-resumed.txt" || true
             }
 
-            # Verify LineageOS-like condition: Google Search app should be absent.
             adb shell pm path com.google.android.googlequicksearchbox > "$OUT/google-app.txt" 2>&1 || true
             adb shell cmd package query-services -a android.speech.RecognitionService > "$OUT/speech-services.txt" 2>&1 || true
 
-            # 1. Cold launch.
             adb shell am force-stop "$PKG"
             adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" | tee "$OUT/01-launch-result.txt"
             sleep 3
             dump_state 01-launch
 
-            # 2. Connect -> MainActivity. This must work without Google Search.
             tap_res imageView_connect
             sleep 6
             dump_state 02-main
@@ -126,17 +123,14 @@ jobs:
               exit 3
             fi
 
-            # 3. Single tap on Kurisu. With no speech provider it must degrade without crashing.
             tap_res imageView_kurisu
             sleep 2
             dump_state 03-speech-fallback
 
-            # 4. Long press loop toggle.
             long_press_res imageView_kurisu
             sleep 2
             dump_state 04-long-press
 
-            # 5. Settings entry via launch logo.
             adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" >/dev/null
             sleep 2
             tap_res imageView_logo
@@ -148,7 +142,6 @@ jobs:
               exit 4
             fi
 
-            # 6. Alarm screen creation smoke test.
             adb shell am start -W -n "$PKG/com.example.yink.amadeus.AlarmActivity" | tee "$OUT/06-alarm-result.txt"
             sleep 2
             dump_state 06-alarm
