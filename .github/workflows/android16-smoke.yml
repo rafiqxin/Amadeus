@@ -1,0 +1,155 @@
+name: Android 16 Emulator Smoke Test
+
+on:
+  push:
+    branches:
+      - modernize/android-36
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: contains(github.event.head_commit.message, '[smoke android16]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Run API 36 emulator smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            set -euxo pipefail
+            PKG=com.example.yink.amadeus.kurisutina
+            APK=app/build/outputs/apk/debug/app-debug.apk
+            mkdir -p smoke-artifacts
+
+            adb install -r "$APK"
+            adb shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
+            adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
+            adb logcat -c
+
+            # 1. Cold launch
+            adb shell am force-stop "$PKG"
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" | tee smoke-artifacts/01-launch-result.txt
+            sleep 3
+            adb exec-out screencap -p > smoke-artifacts/01-launch.png
+            adb shell uiautomator dump /sdcard/window.xml || true
+            adb pull /sdcard/window.xml smoke-artifacts/01-launch.xml || true
+
+            # Utility: tap the center of a resource-id from the latest UI hierarchy.
+            tap_res() {
+              RES="$1"
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
+              python3 - "$RES" <<'PY'
+            import re, subprocess, sys, xml.etree.ElementTree as ET
+            res = sys.argv[1]
+            root = ET.parse('/tmp/window.xml').getroot()
+            for node in root.iter('node'):
+                rid = node.attrib.get('resource-id', '')
+                if rid.endswith('/' + res):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
+                    if not m:
+                        continue
+                    x1,y1,x2,y2 = map(int,m.groups())
+                    x,y=(x1+x2)//2,(y1+y2)//2
+                    print(f'tap {res} at {x},{y}')
+                    subprocess.check_call(['adb','shell','input','tap',str(x),str(y)])
+                    raise SystemExit(0)
+            print('resource not found:', res)
+            raise SystemExit(2)
+            PY
+            }
+
+            long_press_res() {
+              RES="$1"
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
+              python3 - "$RES" <<'PY'
+            import re, subprocess, sys, xml.etree.ElementTree as ET
+            res = sys.argv[1]
+            root = ET.parse('/tmp/window.xml').getroot()
+            for node in root.iter('node'):
+                rid = node.attrib.get('resource-id', '')
+                if rid.endswith('/' + res):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds',''))
+                    if not m: continue
+                    x1,y1,x2,y2 = map(int,m.groups()); x,y=(x1+x2)//2,(y1+y2)//2
+                    subprocess.check_call(['adb','shell','input','swipe',str(x),str(y),str(x),str(y),'1500'])
+                    raise SystemExit(0)
+            raise SystemExit(2)
+            PY
+            }
+
+            # 2. Connect must reach MainActivity even without a Google App hard gate.
+            tap_res imageView_connect
+            sleep 5
+            adb shell dumpsys activity activities | grep -m1 mResumedActivity | tee smoke-artifacts/02-resumed.txt || true
+            adb exec-out screencap -p > smoke-artifacts/02-main.png
+            adb shell uiautomator dump /sdcard/window.xml || true
+            adb pull /sdcard/window.xml smoke-artifacts/02-main.xml || true
+
+            # 3. Kurisu single-tap speech path must not crash.
+            tap_res imageView_kurisu || true
+            sleep 3
+            adb exec-out screencap -p > smoke-artifacts/03-speech.png
+
+            # 4. Kurisu long-press loop toggle must not crash.
+            long_press_res imageView_kurisu || true
+            sleep 2
+            adb exec-out screencap -p > smoke-artifacts/04-long-press.png
+
+            # 5. Settings entry from launch logo.
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" >/dev/null
+            sleep 2
+            tap_res imageView_logo
+            sleep 2
+            adb exec-out screencap -p > smoke-artifacts/05-settings.png
+            adb shell uiautomator dump /sdcard/window.xml || true
+            adb pull /sdcard/window.xml smoke-artifacts/05-settings.xml || true
+
+            # 6. Alarm screen explicit launch smoke test.
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.AlarmActivity" | tee smoke-artifacts/06-alarm-result.txt || true
+            sleep 2
+            adb exec-out screencap -p > smoke-artifacts/06-alarm.png
+
+            # Fail if our process emitted an uncaught Java exception / fatal crash.
+            adb logcat -d > smoke-artifacts/logcat.txt
+            if grep -E "FATAL EXCEPTION|Process: ${PKG}.*has died" smoke-artifacts/logcat.txt; then
+              echo 'Amadeus crashed during API 36 smoke test.'
+              exit 1
+            fi
+
+            adb shell dumpsys package "$PKG" > smoke-artifacts/package.txt
+
+      - name: Upload smoke screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amadeus-android16-smoke
+          path: smoke-artifacts
+          if-no-files-found: warn

@@ -1,0 +1,169 @@
+name: Android 16 AOSP / LineageOS-like Smoke Test
+
+on:
+  push:
+    branches:
+      - modernize/android-36
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-aosp:
+    if: contains(github.event.head_commit.message, '[smoke aosp16]')
+    runs-on: macos-13
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Run API 36 AOSP smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: aosp_atd
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            set -eu
+            PKG=com.example.yink.amadeus.kurisutina
+            APK=app/build/outputs/apk/debug/app-debug.apk
+            OUT=smoke-aosp-artifacts
+            mkdir -p "$OUT"
+
+            adb install -r "$APK" | tee "$OUT/00-install.txt"
+            adb shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
+            adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
+            adb shell settings put system accelerometer_rotation 0 || true
+            adb shell settings put system user_rotation 0 || true
+            adb logcat -c
+
+            tap_res() {
+              RES="$1"
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
+              python3 - "$RES" <<'PY'
+            import re, subprocess, sys, xml.etree.ElementTree as ET
+            res = sys.argv[1]
+            root = ET.parse('/tmp/window.xml').getroot()
+            for node in root.iter('node'):
+                if node.attrib.get('resource-id', '').endswith('/' + res):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds', ''))
+                    if m:
+                        x1, y1, x2, y2 = map(int, m.groups())
+                        x, y = (x1 + x2) // 2, (y1 + y2) // 2
+                        print(f'tap {res} at {x},{y}')
+                        subprocess.check_call(['adb', 'shell', 'input', 'tap', str(x), str(y)])
+                        raise SystemExit(0)
+            print('resource not found:', res)
+            raise SystemExit(2)
+            PY
+            }
+
+            long_press_res() {
+              RES="$1"
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml /tmp/window.xml >/dev/null || true
+              python3 - "$RES" <<'PY'
+            import re, subprocess, sys, xml.etree.ElementTree as ET
+            res = sys.argv[1]
+            root = ET.parse('/tmp/window.xml').getroot()
+            for node in root.iter('node'):
+                if node.attrib.get('resource-id', '').endswith('/' + res):
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds', ''))
+                    if m:
+                        x1, y1, x2, y2 = map(int, m.groups())
+                        x, y = (x1 + x2) // 2, (y1 + y2) // 2
+                        print(f'long press {res} at {x},{y}')
+                        subprocess.check_call(['adb', 'shell', 'input', 'swipe', str(x), str(y), str(x), str(y), '1500'])
+                        raise SystemExit(0)
+            print('resource not found:', res)
+            raise SystemExit(2)
+            PY
+            }
+
+            dump_state() {
+              NAME="$1"
+              adb exec-out screencap -p > "$OUT/${NAME}.png" || true
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null || true
+              adb pull /sdcard/window.xml "$OUT/${NAME}.xml" >/dev/null || true
+              adb shell dumpsys activity activities | grep -m1 mResumedActivity > "$OUT/${NAME}-resumed.txt" || true
+            }
+
+            adb shell pm path com.google.android.googlequicksearchbox > "$OUT/google-app.txt" 2>&1 || true
+            adb shell cmd package query-services -a android.speech.RecognitionService > "$OUT/speech-services.txt" 2>&1 || true
+
+            adb shell am force-stop "$PKG"
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" | tee "$OUT/01-launch-result.txt"
+            sleep 3
+            dump_state 01-launch
+
+            tap_res imageView_connect
+            sleep 6
+            dump_state 02-main
+            if ! grep -q 'MainActivity' "$OUT/02-main-resumed.txt"; then
+              echo 'Connect did not reach MainActivity.' | tee "$OUT/02-main-failure.txt"
+              adb logcat -d > "$OUT/logcat.txt"
+              exit 3
+            fi
+
+            tap_res imageView_kurisu
+            sleep 2
+            dump_state 03-speech-fallback
+
+            long_press_res imageView_kurisu
+            sleep 2
+            dump_state 04-long-press
+
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.LaunchActivity" >/dev/null
+            sleep 2
+            tap_res imageView_logo
+            sleep 2
+            dump_state 05-settings
+            if ! grep -q 'SettingsActivity' "$OUT/05-settings-resumed.txt"; then
+              echo 'SettingsActivity did not become resumed.' | tee "$OUT/05-settings-failure.txt"
+              adb logcat -d > "$OUT/logcat.txt"
+              exit 4
+            fi
+
+            adb shell am start -W -n "$PKG/com.example.yink.amadeus.AlarmActivity" | tee "$OUT/06-alarm-result.txt"
+            sleep 2
+            dump_state 06-alarm
+            if ! grep -q 'AlarmActivity' "$OUT/06-alarm-resumed.txt"; then
+              echo 'AlarmActivity did not become resumed.' | tee "$OUT/06-alarm-failure.txt"
+              adb logcat -d > "$OUT/logcat.txt"
+              exit 5
+            fi
+
+            adb logcat -d > "$OUT/logcat.txt"
+            adb shell dumpsys package "$PKG" > "$OUT/package.txt"
+            if grep -E "FATAL EXCEPTION|Process: ${PKG}.*has died" "$OUT/logcat.txt"; then
+              echo 'Amadeus crashed during Android 16 AOSP smoke test.'
+              exit 6
+            fi
+
+            echo 'ANDROID16_AOSP_SMOKE=PASS' | tee "$OUT/result.txt"
+
+      - name: Upload AOSP screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amadeus-android16-aosp-smoke
+          path: smoke-aosp-artifacts
+          if-no-files-found: warn
